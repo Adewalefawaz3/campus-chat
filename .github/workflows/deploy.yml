@@ -1,0 +1,51 @@
+name: Check and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Never run two deploys at once (protects database migrations).
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+  deploy:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+
+      # 1) Update the database FIRST. Migrations only add things and are tracked,
+      #    so existing data is never touched and the old version keeps working
+      #    for the few seconds before the new one goes live.
+      - name: Run database migrations
+        run: node scripts/migrate.mjs
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # 2) Deploy the Worker + frontend to Cloudflare.
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
