@@ -1,0 +1,31 @@
+# One Worker serves BOTH the API/WebSockets and the built frontend (same origin = no CORS, secure cookies just work).
+name = "campus-chat"
+main = "worker/src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# PostgreSQL connection (pooled + cached by Cloudflare Hyperdrive).
+# Already created in your Cloudflare account as "campus-chat-db" (uses the limited database login `hyperdrive_user`).
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "4bdb3fad53b84de0819cac7be9b504c9"
+localConnectionString = "postgres://postgres:postgres@localhost:5432/campus_chat"
+
+# One Durable Object per room = live WebSocket fan-out (it stores NO data; PostgreSQL does).
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+# (This is Cloudflare's Durable Object class registry, NOT your database migrations.)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+[observability]
+enabled = true

@@ -1,0 +1,23 @@
+{
+  "name": "campus-chat",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite web",
+    "dev:api": "wrangler dev",
+    "build": "vite build web",
+    "typecheck": "tsc --noEmit -p worker && tsc --noEmit -p web",
+    "migrate": "node scripts/migrate.mjs",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.0",
+    "wrangler": "^4.0.0"
+  }
+}
