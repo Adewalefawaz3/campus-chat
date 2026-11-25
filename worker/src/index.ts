@@ -66,12 +66,16 @@ async function auth(sql: any, req: Request) {
   const token = readToken(req);
   if (!token) throw new HttpError(401, "Please sign in.");
   const [row] = await sql`
-    update sessions s set last_seen_at = now()
-    from users u
-    where s.token_hash = ${await sha256(token)} and u.id = s.user_id
-      and s.revoked_at is null and s.expires_at > now()
-      and (s.idle_timeout_s is null or s.last_seen_at + make_interval(secs => s.idle_timeout_s) > now())
-    returning u.id, u.display_name, u.email, s.id as session_id, s.shared_device`;
+    with cur as (
+      select u.id, u.display_name, u.email, s.id as session_id, s.shared_device
+      from sessions s join users u on u.id = s.user_id
+      where s.token_hash = ${await sha256(token)} and s.revoked_at is null and s.expires_at > now()
+        and (s.idle_timeout_s is null or s.last_seen_at + make_interval(secs => s.idle_timeout_s) > now())
+    ), touch as (
+      update sessions set last_seen_at = now()
+      where id = (select session_id from cur) and last_seen_at < now() - interval '60 seconds'
+    )
+    select * from cur`;
   if (!row) throw new HttpError(401, "Your session ended. Please sign in again.");
   return row;
 }
@@ -121,11 +125,13 @@ async function broadcast(env: Env, roomId: string, event: unknown) {
 }
 
 /* ---------- request handling ---------- */
-async function handle(req: Request, env: Env, sql: any): Promise<Response> {
+async function handle(req: Request, env: Env, sql: any, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(req.url);
   const p = url.pathname;
   const m = req.method;
   const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
+  // Always called AFTER the database write succeeded; never delays the reply.
+  const bcast = (roomId: string, ev: unknown) => ctx.waitUntil(broadcast(env, roomId, ev));
   const body = async () => {
     try {
       return (await req.json()) as any;
@@ -200,10 +206,54 @@ async function handle(req: Request, env: Env, sql: any): Promise<Response> {
   }
 
   if (m === "GET" && p === "/api/me") {
-    const rooms = await sql`select r.id, r.name, r.kind, m.role from room_members m
-      join rooms r on r.id = m.room_id
-      where m.user_id = ${user.id} and m.status = 'active' and r.deleted_at is null order by r.created_at`;
+    const rooms = await sql`select r.id, r.name, r.kind, m.role,
+        (select count(*)::int from room_members x where x.room_id = r.id and x.status = 'active') as members,
+        lm.body as last_body, lm.kind as last_kind, lm.created_at as last_at, lu.display_name as last_by
+      from room_members m join rooms r on r.id = m.room_id
+      left join lateral (select body, kind, created_at, user_id from messages
+        where room_id = r.id and deleted_at is null order by id desc limit 1) lm on true
+      left join users lu on lu.id = lm.user_id
+      where m.user_id = ${user.id} and m.status = 'active' and r.deleted_at is null
+      order by coalesce(lm.created_at, r.created_at) desc`;
     return json({ user: { id: user.id, display_name: user.display_name, email: user.email, shared: user.shared_device }, rooms });
+  }
+
+  if (m === "GET" && p === "/api/profile") {
+    const identities = await sql`select school, matric_raw from user_identities where user_id = ${user.id} order by created_at`;
+    return json({ user: { id: user.id, display_name: user.display_name, email: user.email }, identities });
+  }
+
+  if (m === "POST" && p === "/api/profile") {
+    const b = await body();
+    const name = str(b.displayName, 60);
+    if (name.length < 2) throw new HttpError(400, "Enter your name (at least 2 characters).");
+    const school = str(b.school, 120);
+    const matric = normMatric(b.matric);
+    if (school && matric) {
+      const [mine] = await sql`select matric_norm from user_identities where user_id = ${user.id} and school = ${school}`;
+      if (mine && mine.matric_norm !== matric) throw new HttpError(403, "A saved matric number can't be changed here. Ask a room admin for help.");
+      if (!mine) {
+        try {
+          await sql`insert into user_identities (user_id, school, matric_raw, matric_norm) values (${user.id}, ${school}, ${str(b.matric, 40)}, ${matric})`;
+        } catch (e: any) {
+          if (e?.code === "23505") throw new HttpError(409, "That matric number is already claimed by another account.");
+          throw e;
+        }
+      }
+    }
+    await sql`update users set display_name = ${name} where id = ${user.id}`;
+    return json({ ok: true });
+  }
+
+  if (m === "POST" && p === "/api/profile/password") {
+    const b = await body();
+    const [u] = await sql`select password_hash from users where id = ${user.id}`;
+    if (!(await verifyPassword(String(b.current ?? ""), u.password_hash))) throw new HttpError(403, "Your current password is wrong.");
+    const next = String(b.next ?? "");
+    if (next.length < 8) throw new HttpError(400, "Use a new password of at least 8 characters.");
+    await sql`update users set password_hash = ${await hashPassword(next)} where id = ${user.id}`;
+    await sql`update sessions set revoked_at = now() where user_id = ${user.id} and id <> ${user.session_id} and revoked_at is null`;
+    return json({ ok: true });
   }
 
   if (m === "POST" && p === "/api/rooms") {
@@ -216,10 +266,16 @@ async function handle(req: Request, env: Env, sql: any): Promise<Response> {
     const rules: any[] = [];
     if (joinMode === "matric_locked") {
       const mx = b.matric ?? {};
-      const prefix = normMatric(mx.prefix);
-      const start = parseInt(mx.start, 10), end = parseInt(mx.end, 10), width = parseInt(mx.width, 10);
-      if (!prefix || !(start >= 0) || !(end >= start)) throw new HttpError(400, "Enter the matric prefix and a valid number range, e.g. 22/66MG and 1 to 250.");
-      rules.push({ kind: "range", prefix, start, end, width: width > 0 ? width : null });
+      for (const line of String(mx.ranges ?? "").split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        const r = /^(.+?)[\s:]+(\d+)\s*(?:-|–|to)\s*(\d+)$/i.exec(t);
+        if (!r || !normMatric(r[1])) throw new HttpError(400, `Couldn't read "${t}". Write each range like: 22/66MG 001-250`);
+        const start = parseInt(r[2], 10), end = parseInt(r[3], 10);
+        if (end < start) throw new HttpError(400, `In "${t}" the last number is smaller than the first.`);
+        rules.push({ kind: "range", prefix: normMatric(r[1]), start, end, width: r[2].length === r[3].length && r[2].length > 1 ? r[2].length : null });
+      }
+      if (!rules.length) throw new HttpError(400, "Add at least one matric range, for example: 22/66MG 001-250");
       for (const a of String(mx.allow ?? "").split(/[,\n]/)) if (normMatric(a)) rules.push({ kind: "allow", prefix: normMatric(a) });
       for (const x of String(mx.block ?? "").split(/[,\n]/)) if (normMatric(x)) rules.push({ kind: "block", prefix: normMatric(x) });
     }
@@ -319,19 +375,28 @@ async function handle(req: Request, env: Env, sql: any): Promise<Response> {
       return env.ROOM.get(env.ROOM.idFromName(roomId)).fetch(req);
     }
 
+    const canPost = async () => {
+      if (mem.chat_mode === "admins_only" && !isAdmin(mem.role)) throw new HttpError(403, "Only admins can post right now.");
+      if (mem.slow_mode_s > 0 && !isAdmin(mem.role)) {
+        const [last] = await sql`select extract(epoch from now() - max(created_at))::int as ago from messages where room_id = ${roomId} and user_id = ${user.id}`;
+        if (last?.ago != null && last.ago < mem.slow_mode_s)
+          throw new HttpError(429, `Slow mode is on. Wait ${mem.slow_mode_s - last.ago}s before sending again.`);
+      }
+    };
+
     if (m === "GET" && sub === "/messages") {
       const after = parseInt(url.searchParams.get("after") ?? "", 10);
       const before = parseInt(url.searchParams.get("before") ?? "", 10);
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 200);
       let rows: any[];
       if (after >= 0) {
-        rows = await sql`select m.id, m.client_id, m.user_id, m.body, m.created_at, u.display_name
-          from messages m join users u on u.id = m.user_id
+        rows = await sql`select m.id, m.client_id, m.user_id, m.kind, m.body, m.created_at, u.display_name, v.id as voice_id, v.duration_ms
+          from messages m join users u on u.id = m.user_id left join voice_notes v on v.message_id = m.id
           where m.room_id = ${roomId} and m.deleted_at is null and m.id > ${after}
           order by m.id asc limit ${limit}`;
       } else {
-        rows = await sql`select m.id, m.client_id, m.user_id, m.body, m.created_at, u.display_name
-          from messages m join users u on u.id = m.user_id
+        rows = await sql`select m.id, m.client_id, m.user_id, m.kind, m.body, m.created_at, u.display_name, v.id as voice_id, v.duration_ms
+          from messages m join users u on u.id = m.user_id left join voice_notes v on v.message_id = m.id
           where m.room_id = ${roomId} and m.deleted_at is null and (${before >= 0 ? before : null}::bigint is null or m.id < ${before >= 0 ? before : null}::bigint)
           order by m.id desc limit ${limit}`;
         rows.reverse();
@@ -344,26 +409,120 @@ async function handle(req: Request, env: Env, sql: any): Promise<Response> {
       const text = str(b.body, 2000);
       if (!text) throw new HttpError(400, "Write a message first.");
       if (!isUuid(String(b.clientId ?? ""))) throw new HttpError(400, "Invalid message id.");
-      if (mem.chat_mode === "admins_only" && !isAdmin(mem.role)) throw new HttpError(403, "Only admins can post right now.");
-      if (mem.slow_mode_s > 0 && !isAdmin(mem.role)) {
-        const [last] = await sql`select extract(epoch from now() - max(created_at))::int as ago from messages where room_id = ${roomId} and user_id = ${user.id}`;
-        if (last?.ago != null && last.ago < mem.slow_mode_s)
-          throw new HttpError(429, `Slow mode is on. Wait ${mem.slow_mode_s - last.ago}s before sending again.`);
-      }
+      await canPost();
       // 1) SAVE to PostgreSQL. If this throws, nothing is broadcast and the client sees an error.
       let [saved] = await sql`with ins as (
           insert into messages (room_id, user_id, client_id, body) values (${roomId}, ${user.id}, ${b.clientId}, ${text})
           on conflict (room_id, user_id, client_id) do nothing returning *)
-        select ins.id, ins.client_id, ins.user_id, ins.body, ins.created_at, ${user.display_name}::text as display_name from ins`;
+        select ins.id, ins.client_id, ins.user_id, ins.kind, ins.body, ins.created_at, ${user.display_name}::text as display_name,
+               null::uuid as voice_id, null::int as duration_ms from ins`;
       if (saved) {
-        // 2) ONLY NOW tell everyone else.
-        await broadcast(env, roomId, { type: "message", message: saved });
+        // 2) ONLY NOW tell everyone else (in the background, so the sender isn't kept waiting).
+        bcast(roomId, { type: "message", message: saved });
         return json({ message: saved }, 201);
       }
       // Same clientId retried: return the stored copy, don't duplicate.
-      [saved] = await sql`select m.id, m.client_id, m.user_id, m.body, m.created_at, u.display_name from messages m
-        join users u on u.id = m.user_id where m.room_id = ${roomId} and m.user_id = ${user.id} and m.client_id = ${b.clientId}`;
+      [saved] = await sql`select m.id, m.client_id, m.user_id, m.kind, m.body, m.created_at, u.display_name, null::uuid as voice_id, null::int as duration_ms
+        from messages m join users u on u.id = m.user_id
+        where m.room_id = ${roomId} and m.user_id = ${user.id} and m.client_id = ${b.clientId}`;
       return json({ message: saved }, 200);
+    }
+
+    if (m === "POST" && sub === "/voice") {
+      const clientId = req.headers.get("x-client-id") ?? "";
+      if (!isUuid(clientId)) throw new HttpError(400, "Invalid message id.");
+      await canPost();
+      const mime = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      if (!/^audio\/(webm|ogg|mp4|aac|mpeg|x-m4a|m4a)$/.test(mime)) throw new HttpError(400, "This audio format isn't supported.");
+      const data = new Uint8Array(await req.arrayBuffer());
+      if (!data.length) throw new HttpError(400, "The recording was empty.");
+      if (data.length > 700_000) throw new HttpError(413, "That voice note is too long. Keep it under 60 seconds.");
+      const dur = Math.min(Math.max(parseInt(req.headers.get("x-duration-ms") ?? "0", 10) || 0, 0), 60000);
+      const saved = await sql.begin(async (tx: any) => {
+        const [ins] = await tx`insert into messages (room_id, user_id, client_id, kind, body)
+          values (${roomId}, ${user.id}, ${clientId}, 'voice', 'Voice note')
+          on conflict (room_id, user_id, client_id) do nothing returning id, client_id, user_id, kind, body, created_at`;
+        if (!ins) return null;
+        const [v] = await tx`insert into voice_notes (message_id, room_id, user_id, mime, duration_ms, data)
+          values (${ins.id}, ${roomId}, ${user.id}, ${mime}, ${dur}, ${data}) returning id`;
+        return { ...ins, display_name: user.display_name, voice_id: v.id, duration_ms: dur };
+      });
+      if (saved) {
+        bcast(roomId, { type: "message", message: saved });
+        return json({ message: saved }, 201);
+      }
+      const [existing] = await sql`select m.id, m.client_id, m.user_id, m.kind, m.body, m.created_at, u.display_name, v.id as voice_id, v.duration_ms
+        from messages m join users u on u.id = m.user_id left join voice_notes v on v.message_id = m.id
+        where m.room_id = ${roomId} and m.user_id = ${user.id} and m.client_id = ${clientId}`;
+      return json({ message: existing }, 200);
+    }
+
+    const vm = /^\/voice\/([0-9a-f-]{36})$/i.exec(sub);
+    if (m === "GET" && vm) {
+      const [v] = await sql`select data, mime from voice_notes where id = ${vm[1]} and room_id = ${roomId}`;
+      if (!v) throw new HttpError(404, "Voice note not found.");
+      const bytes: Uint8Array = v.data;
+      const total = bytes.length;
+      const base: Record<string, string> = { "content-type": v.mime, "accept-ranges": "bytes", "cache-control": "private, max-age=31536000, immutable" };
+      const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.get("range") ?? ""); // iPhones need Range support to play audio
+      if (range && (range[1] || range[2])) {
+        const start = range[1] ? parseInt(range[1], 10) : Math.max(total - parseInt(range[2], 10), 0);
+        const end = range[1] && range[2] ? Math.min(parseInt(range[2], 10), total - 1) : total - 1;
+        if (start > end || start >= total) return new Response(null, { status: 416, headers: { ...base, "content-range": `bytes */${total}` } });
+        return new Response(bytes.subarray(start, end + 1), {
+          status: 206,
+          headers: { ...base, "content-range": `bytes ${start}-${end}/${total}`, "content-length": String(end - start + 1) },
+        });
+      }
+      return new Response(bytes, { headers: { ...base, "content-length": String(total) } });
+    }
+
+    if (m === "GET" && sub === "/polls") {
+      const polls = await sql`select p.id, p.question, p.created_at, u.display_name as author,
+          (select option_id from poll_votes v where v.poll_id = p.id and v.user_id = ${user.id}) as my_vote,
+          coalesce((select json_agg(json_build_object('id', o.id, 'label', o.label,
+            'votes', (select count(*)::int from poll_votes v2 where v2.option_id = o.id)) order by o.position)
+            from poll_options o where o.poll_id = p.id), '[]'::json) as options
+        from polls p join users u on u.id = p.created_by
+        where p.room_id = ${roomId} order by p.created_at desc limit 30`;
+      return json({ polls });
+    }
+
+    if (m === "POST" && sub === "/polls") {
+      if (!isAdmin(mem.role)) throw new HttpError(403, "Only admins can create polls.");
+      const b = await body();
+      const question = str(b.question, 200);
+      const options = (Array.isArray(b.options) ? b.options : []).map((o: any) => str(o, 80)).filter(Boolean).slice(0, 6);
+      if (question.length < 2) throw new HttpError(400, "Write the poll question.");
+      if (options.length < 2) throw new HttpError(400, "Add at least two options.");
+      const poll = await sql.begin(async (tx: any) => {
+        const [pl] = await tx`insert into polls (room_id, created_by, question) values (${roomId}, ${user.id}, ${question}) returning id, question, created_at`;
+        const opts: any[] = [];
+        for (let i = 0; i < options.length; i++) {
+          const [o] = await tx`insert into poll_options (poll_id, label, position) values (${pl.id}, ${options[i]}, ${i}) returning id, label`;
+          opts.push({ id: o.id, label: o.label, votes: 0 });
+        }
+        await tx`insert into audit_log (room_id, actor_id, action, target_type, target_id) values (${roomId}, ${user.id}, 'poll.create', 'poll', ${pl.id})`;
+        return { ...pl, author: user.display_name, my_vote: null, options: opts };
+      });
+      bcast(roomId, { type: "poll", poll });
+      return json({ poll }, 201);
+    }
+
+    const pv = /^\/polls\/([0-9a-f-]{36})\/vote$/i.exec(sub);
+    if (m === "POST" && pv) {
+      const b = await body();
+      const [opt] = await sql`select o.id from poll_options o join polls p on p.id = o.poll_id
+        where p.id = ${pv[1]} and p.room_id = ${roomId} and o.id = ${String(b.optionId ?? "")}`;
+      if (!opt) throw new HttpError(404, "That poll option doesn't exist.");
+      await sql`insert into poll_votes (poll_id, user_id, option_id) values (${pv[1]}, ${user.id}, ${opt.id})
+        on conflict (poll_id, user_id) do update set option_id = excluded.option_id, created_at = now()`;
+      const rows = await sql`select o.id, (select count(*)::int from poll_votes v where v.option_id = o.id) as votes
+        from poll_options o where o.poll_id = ${pv[1]}`;
+      const counts: Record<string, number> = {};
+      for (const r of rows) counts[r.id] = r.votes;
+      bcast(roomId, { type: "poll_votes", pollId: pv[1], counts });
+      return json({ pollId: pv[1], counts, myVote: opt.id });
     }
 
     if (m === "POST" && sub === "/invite/rotate") {
@@ -387,7 +546,7 @@ async function handle(req: Request, env: Env, sql: any): Promise<Response> {
         await tx`insert into audit_log (room_id, actor_id, action, meta)
           values (${roomId}, ${user.id}, 'room.settings', ${JSON.stringify({ chatMode, slow })}::jsonb)`;
       });
-      await broadcast(env, roomId, { type: "room", chat_mode: chatMode, slow_mode_s: slow });
+      bcast(roomId, { type: "room", chat_mode: chatMode, slow_mode_s: slow });
       return json({ chat_mode: chatMode, slow_mode_s: slow });
     }
   }
@@ -402,7 +561,7 @@ export default {
 
     const sql = postgres(env.HYPERDRIVE.connectionString, { max: 5, fetch_types: false });
     try {
-      return await handle(req, env, sql);
+      return await handle(req, env, sql, ctx);
     } catch (e: any) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       console.error("API error", e);
