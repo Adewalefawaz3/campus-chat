@@ -90,7 +90,7 @@ function renderAuth(inviteCode?: string) {
         <label>Email</label><input name="email" type="email" autocomplete="username" required />
         <label>Password</label><input name="password" type="password" minlength="8" autocomplete="${mode === "signup" ? "new-password" : "current-password"}" required />
         ${mode === "signup" ? `<label>School (optional)</label><input name="school" placeholder="e.g. University of Ilorin" />
-        <label>Matric number (optional)</label><input name="matric" placeholder="e.g. 22/66MG/045" />` : ""}
+        <label>Matric number (optional)</label><input name="matric" placeholder="e.g. MM001" />` : ""}
         <label class="check"><input type="checkbox" name="shared" /> I'm on a shared or public device</label>
         <p class="err" id="err"></p>
         <button class="primary" style="width:100%;margin-top:6px">${mode === "login" ? "Sign in" : "Create account"}</button>
@@ -115,8 +115,8 @@ function renderAuth(inviteCode?: string) {
   draw();
 }
 
-function shell(inner: string, active = "") {
-  return `<div class="shell ${active ? "" : "home"}">
+function shell(inner: string, active = "", mode = active ? "room" : "home") {
+  return `<div class="shell ${mode}">
     <aside class="rail"><h2>Campus Chat</h2>
       ${rooms.map((r) => `<button class="room ${r.id === active ? "on" : ""}" data-room="${r.id}">${esc(r.name)}</button>`).join("") || `<p class="muted">You haven't joined any rooms yet.</p>`}
       <button class="primary" style="width:100%;margin-top:12px" id="new">New room</button>
@@ -127,6 +127,7 @@ function shell(inner: string, active = "") {
     </aside>${inner}</div>`;
 }
 function wireShell() {
+  document.querySelectorAll("[data-back]").forEach((b: any) => (b.onclick = () => go("/")));
   document.querySelectorAll("[data-room]").forEach((b: any) => (b.onclick = () => go("/r/" + b.dataset.room)));
   $("#new").onclick = () => go("/new");
   $("#joinbtn").onclick = () => go("/join");
@@ -140,12 +141,12 @@ function renderHome() {
   if (p === "/new") return renderNewRoom();
   if (p === "/join") return renderJoin("");
   app.innerHTML = shell(`<main class="main"><div class="center" style="margin-top:12vh"><h1>Welcome, ${esc(me.display_name)}</h1>
-    <p class="muted">Pick a room on the left, create one for your class, or join with a code from your course rep.</p></div></main>`);
+    <p class="muted">Pick a room, create one for your class, or join with a code from your course rep.</p></div></main>`);
   wireShell();
 }
 
 function renderNewRoom() {
-  app.innerHTML = shell(`<main class="main" style="overflow:auto"><div class="center" style="margin-top:4vh"><div class="card"><h2>New room</h2>
+  app.innerHTML = shell(`<main class="main" style="overflow:auto"><div class="center" style="margin-top:4vh"><div class="card"><button class="link back" data-back type="button">← Back</button><h2>New room</h2>
     <form id="f">
       <label>Room name</label><input name="name" placeholder="e.g. 100L Microbiology" required />
       <label>Type</label><select name="kind"><option value="departmental">Departmental (class)</option><option value="general">General (hostel, club, team)</option></select>
@@ -155,7 +156,7 @@ function renderNewRoom() {
         <label>Level</label><input name="level" placeholder="100L" />
         <label>Who can join</label><select name="joinMode"><option value="matric_locked">Only matric numbers in my list</option><option value="code_only">Anyone with the code</option></select>
         <div id="mx">
-          <label>Matric prefix</label><input name="prefix" placeholder="22/66MG" />
+          <label>Matric prefix</label><input name="prefix" placeholder="e.g. MM" />
           <div class="row"><div><label>From</label><input name="start" type="number" min="0" value="1" /></div>
           <div><label>To</label><input name="end" type="number" min="0" value="250" /></div>
           <div><label>Digits</label><input name="width" type="number" min="1" value="3" /></div></div>
@@ -165,7 +166,7 @@ function renderNewRoom() {
       </div>
       <p class="err" id="err"></p>
       <button class="primary" style="width:100%">Create room</button>
-    </form></div></div></main>`);
+    </form></div></div></main>`, "", "sub");
   wireShell();
   const sync = () => {
     const f = $("#f"), dep = f.kind.value === "departmental";
@@ -186,15 +187,15 @@ async function renderJoin(code: string) {
   let preview: any = null;
   if (code) { try { preview = (await api("/api/invite/" + code)).room; } catch (e: any) { preview = { error: e.message }; } }
   const needsMatric = !code || preview?.join_mode === "matric_locked";
-  const inner = `<main class="main"><div class="center" style="margin-top:8vh"><div class="card"><h2>Join a room</h2>
+  const inner = `<main class="main"><div class="center" style="margin-top:8vh"><div class="card">${me ? `<button class="link back" data-back type="button">← Back</button>` : ""}<h2>Join a room</h2>
     ${preview?.error ? `<p class="err">${esc(preview.error)}</p>` : preview ? `<p><strong>${esc(preview.name)}</strong><br><span class="muted">${esc([preview.school, preview.department, preview.level].filter(Boolean).join(", "))}</span></p>` : ""}
     <form id="f">
       ${code ? "" : `<label>Room code</label><input name="code" class="code" required />`}
-      ${needsMatric ? `<label>Matric number (only if the room asks for it)</label><input name="matric" placeholder="22/66MG/045" />` : ""}
+      ${needsMatric ? `<label>Matric number (only if the room asks for it)</label><input name="matric" placeholder="e.g. MM001" />` : ""}
       <p class="err" id="err"></p>
       <button class="primary" style="width:100%">Join room</button>
     </form></div></div></main>`;
-  app.innerHTML = me ? shell(inner) : inner;
+  app.innerHTML = me ? shell(inner, "", "sub") : inner;
   if (me) wireShell();
   $("#f").onsubmit = async (e: Event) => {
     e.preventDefault();
@@ -215,7 +216,7 @@ async function renderRoom(id: string) {
   let lastId = 0;
 
   app.innerHTML = shell(`<main class="main">
-    <div class="top"><div><strong>${esc(info.room.name)}</strong> <span class="muted" id="state"></span></div>
+    <div class="top"><div><button class="link back" id="back" type="button">← Rooms</button> <strong>${esc(info.room.name)}</strong> <span class="muted" id="state"></span></div>
       ${admin ? `<button id="tools">Admin tools</button>` : ""}</div>
     <div id="panel" class="panel" hidden></div>
     <div id="banner" class="banner" hidden></div>
@@ -223,6 +224,7 @@ async function renderRoom(id: string) {
     <form class="compose" id="send"><input id="text" placeholder="Write a message" autocomplete="off" maxlength="2000" /><button class="primary">Send</button></form>
   </main>`, id);
   wireShell();
+  $("#back").onclick = () => go("/");
   currentRoom = id;
 
   const draw = () => {
